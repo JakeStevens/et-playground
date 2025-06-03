@@ -33,9 +33,6 @@ def load_and_preprocess_image():
     batch_img_tensor = preprocessed_img.unsqueeze(0)
     return batch_img_tensor.to('cpu')
 
-# Global Variable for Preprocessed Image
-PREPROCESSED_IMAGE_TENSOR = load_and_preprocess_image()
-
 # Define Model Loading Function
 def load_model():
     """Loads a pre-trained ResNet model."""
@@ -47,19 +44,6 @@ def load_model():
     except Exception as e:
         print(f"Error loading model: {e}")
         return None
-
-# Global Variable for Model
-MODEL = load_model()
-
-# Warm-up Runs
-if MODEL is not None and PREPROCESSED_IMAGE_TENSOR is not None:
-    print("Performing warm-up runs...")
-    for _ in range(5):  # Perform 5 warm-up runs
-        with torch.no_grad():
-            MODEL(PREPROCESSED_IMAGE_TENSOR)
-    print("Warm-up complete.")
-else:
-    print("Skipping warm-up runs due to issues with model or image loading.")
 
 # Define Benchmarking Function
 def benchmark_inference(model, image_tensor):
@@ -80,16 +64,6 @@ def benchmark_inference(model, image_tensor):
     
     return avg_latency, min_latency, max_latency, std_latency
 
-# Global Variables for Latency Statistics
-AVG_LATENCY, MIN_LATENCY, MAX_LATENCY, STD_LATENCY = None, None, None, None
-
-if MODEL is not None and PREPROCESSED_IMAGE_TENSOR is not None:
-    print("Performing benchmarking...")
-    AVG_LATENCY, MIN_LATENCY, MAX_LATENCY, STD_LATENCY = benchmark_inference(MODEL, PREPROCESSED_IMAGE_TENSOR)
-    print(f"Benchmarking complete. Average latency: {AVG_LATENCY:.2f} ms")
-else:
-    print("Skipping benchmarking due to issues with model or image loading.")
-
 # Define Top 5 Predictions Function
 def get_top5_predictions(model, image_tensor, imagenet_classes):
     """Performs inference and returns the top 5 predictions."""
@@ -109,34 +83,93 @@ def get_top5_predictions(model, image_tensor, imagenet_classes):
         })
     return results
 
-# Global Variable for Top 5 Predictions
-TOP_5_PREDICTIONS = []
+# Define Main Inference Function
+def get_inference_results():
+    """
+    Performs all inference steps: image loading, model loading, warm-up,
+    benchmarking, and prediction.
+    Returns a dictionary with all results or error information.
+    """
+    preprocessed_image_tensor = load_and_preprocess_image()
+    model = load_model()
 
-if MODEL is not None and PREPROCESSED_IMAGE_TENSOR is not None:
+    if model is None or preprocessed_image_tensor is None:
+        error_message = "Failed to load model" if model is None else "Failed to load and preprocess image"
+        if model is None and preprocessed_image_tensor is None:
+            error_message = "Failed to load model and image"
+        print(f"Error in get_inference_results: {error_message}")
+        return {
+            'error': error_message,
+            'top_5_predictions': [],
+            'avg_latency': None,
+            'min_latency': None,
+            'max_latency': None,
+            'std_latency': None,
+            'image_url': IMAGE_URL  # Still provide IMAGE_URL for the template
+        }
+
+    # Perform warm-up runs
+    print("Performing warm-up runs...")
+    for _ in range(5):
+        with torch.no_grad():
+            model(preprocessed_image_tensor)
+    print("Warm-up complete.")
+
+    # Perform benchmarking
+    print("Performing benchmarking...")
+    avg_latency, min_latency, max_latency, std_latency = benchmark_inference(model, preprocessed_image_tensor)
+    print(f"Benchmarking complete. Average latency: {avg_latency:.2f} ms")
+
+    # Get top 5 predictions
     print("Generating top 5 predictions...")
-    TOP_5_PREDICTIONS = get_top5_predictions(MODEL, PREPROCESSED_IMAGE_TENSOR, IMAGENET_CLASSES)
+    top_5_predictions = get_top5_predictions(model, preprocessed_image_tensor, IMAGENET_CLASSES)
     print("Top 5 predictions generated.")
-    # For debugging, you might want to print them:
-    # for pred in TOP_5_PREDICTIONS:
-    #     print(f"- {pred['name']}: {pred['prob']:.4f}")
-else:
-    print("Skipping generation of top 5 predictions due to issues with model or image loading.")
+
+    return {
+        'top_5_predictions': top_5_predictions,
+        'avg_latency': avg_latency,
+        'min_latency': min_latency,
+        'max_latency': max_latency,
+        'std_latency': std_latency,
+        'image_url': IMAGE_URL,
+        'error': None
+        # 'model': model, # also return model and tensor for global assignment - REMOVED
+        # 'preprocessed_image_tensor': preprocessed_image_tensor - REMOVED
+    }
+
+# Removed global population of inference_results
+# MODEL = None # Removed
+# PREPROCESSED_IMAGE_TENSOR = None # Removed
+# TOP_5_PREDICTIONS = [] # Removed
+# AVG_LATENCY, MIN_LATENCY, MAX_LATENCY, STD_LATENCY = None, None, None, None # Removed
+
 
 @app.route('/')
 def index():
-    # Prepare predictions list for HTML
+    results = get_inference_results()
     predictions_html = ""
-    if TOP_5_PREDICTIONS:
-        for pred in TOP_5_PREDICTIONS:
-            predictions_html += f"<li>Class Name: {pred['name']}, Probability: {pred['prob']*100:.4f}%</li>"
-    else:
-        predictions_html = "<li>Top 5 predictions not available.</li>"
+    current_image_url = results.get('image_url', IMAGE_URL) # Use IMAGE_URL from constants as fallback
 
-    # Prepare latency stats for HTML, handling None cases
-    avg_latency_html = f"{AVG_LATENCY:.2f} ms" if AVG_LATENCY is not None else "N/A"
-    min_latency_html = f"{MIN_LATENCY:.2f} ms" if MIN_LATENCY is not None else "N/A"
-    max_latency_html = f"{MAX_LATENCY:.2f} ms" if MAX_LATENCY is not None else "N/A"
-    std_latency_html = f"{STD_LATENCY:.2f} ms" if STD_LATENCY is not None else "N/A"
+    if results['error']:
+        predictions_html = f"<li>Error: {results['error']}</li>"
+        avg_latency_html = "N/A"
+        min_latency_html = "N/A"
+        max_latency_html = "N/A"
+        std_latency_html = "N/A"
+    else:
+        if results['top_5_predictions']:
+            for pred in results['top_5_predictions']:
+                if isinstance(pred, dict) and 'name' in pred and 'prob' in pred:
+                    predictions_html += f"<li>Class Name: {pred['name']}, Probability: {pred['prob']*100:.4f}%</li>"
+                else:
+                    predictions_html += "<li>Invalid prediction format.</li>"
+        else:
+            predictions_html = "<li>No predictions available.</li>"
+
+        avg_latency_html = f"{results['avg_latency']:.2f} ms" if results['avg_latency'] is not None else "N/A"
+        min_latency_html = f"{results['min_latency']:.2f} ms" if results['min_latency'] is not None else "N/A"
+        max_latency_html = f"{results['max_latency']:.2f} ms" if results['max_latency'] is not None else "N/A"
+        std_latency_html = f"{results['std_latency']:.2f} ms" if results['std_latency'] is not None else "N/A"
 
     html_content = f"""
     <!DOCTYPE html>
@@ -163,8 +196,8 @@ def index():
 
             <div class="image-display">
                 <h2>Source Image</h2>
-                <img src="{IMAGE_URL}" alt="Inference Image">
-                <p style="text-align:center;">Image URL used for inference: <a href="{IMAGE_URL}" target="_blank">{IMAGE_URL}</a></p>
+                <img src="{current_image_url}" alt="Inference Image">
+                <p style="text-align:center;">Image URL used for inference: <a href="{current_image_url}" target="_blank">{current_image_url}</a></p>
             </div>
 
             <div class="predictions">
@@ -188,11 +221,6 @@ def index():
     return html_content
 
 if __name__ == '__main__':
-    # Check if critical components are loaded before running
-    if PREPROCESSED_IMAGE_TENSOR is None:
-        print("CRITICAL: Failed to load and preprocess the image. The Flask app might not display predictions correctly.")
-    if MODEL is None:
-        print("CRITICAL: Failed to load the model. The Flask app might not display predictions correctly.")
-    
+    # Critical error checks removed as errors are handled per request in index()
     print("Starting Flask development server...")
     app.run(debug=True, use_reloader=False)
