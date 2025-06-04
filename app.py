@@ -13,20 +13,6 @@ import torchvision.models as models
 # Initialize Flask App
 app = Flask(__name__)
 
-# --- Global variables for benchmarking state ---
-benchmark_status = {
-    'status': 'idle',  # idle, running, complete, error
-    'progress': 0,    # 0-100
-    'results': None,
-    'error_message': None
-}
-benchmark_lock = threading.Lock()
-# --- Store model and tensor for benchmark thread ---
-# These will be populated by the main route before benchmark starts
-_global_model_for_benchmark = None
-_global_tensor_for_benchmark = None
-# --- End Global variables ---
-
 # Define Image Downloading and Preprocessing Function
 def load_and_preprocess_image():
     """Downloads an image from IMAGE_URL, preprocesses it, and returns a batch tensor."""
@@ -61,48 +47,37 @@ def load_model():
         return None
 
 # Define Benchmarking Function
-def benchmark_inference(model, image_tensor):
-    """Performs inference 1000 times and returns latency statistics, updating global status."""
-    global benchmark_status, benchmark_lock
+def benchmark_inference(model, image_tensor, progress_callback):
+    """Performs inference 1000 times, reports progress, and returns latency statistics."""
     latencies = []
-    total_iterations = 1000 # Defined for clarity
+    total_iterations = 1000
 
-    try:
-        for i in range(total_iterations):
-            start_time = time.time()
-            with torch.no_grad():
-                model(image_tensor)
-            end_time = time.time()
-            latency_ms = (end_time - start_time) * 1000
-            latencies.append(latency_ms)
+    if not model or not image_tensor:
+        raise ValueError("Model or image tensor not provided to benchmark_inference")
 
-            # Update progress
-            current_progress = int(((i + 1) / total_iterations) * 100)
-            with benchmark_lock:
-                benchmark_status['progress'] = current_progress
+    for i in range(total_iterations):
+        start_time = time.time()
+        with torch.no_grad():
+            model(image_tensor)
+        end_time = time.time()
+        latency_ms = (end_time - start_time) * 1000
+        latencies.append(latency_ms)
 
-        avg_latency = np.mean(latencies)
-        min_latency = np.min(latencies)
-        max_latency = np.max(latencies)
-        std_latency = np.std(latencies)
+        current_progress = int(((i + 1) / total_iterations) * 100)
+        if progress_callback:
+            progress_callback(current_progress)
 
-        with benchmark_lock:
-            benchmark_status['results'] = {
-                'avg_latency': avg_latency,
-                'min_latency': min_latency,
-                'max_latency': max_latency,
-                'std_latency': std_latency
-            }
-            # Status will be set to 'complete' by the calling thread function
-        return avg_latency, min_latency, max_latency, std_latency # Still return for potential direct use or other callers
-    except Exception as e:
-        print(f"Error during benchmarking: {e}")
-        with benchmark_lock:
-            benchmark_status['status'] = 'error'
-            benchmark_status['error_message'] = str(e)
-            benchmark_status['results'] = None
-        # Re-raise or return error indication if needed by other parts of the app not using global status
-        raise # Or return None, None, None, None
+    avg_latency = np.mean(latencies)
+    min_latency = np.min(latencies)
+    max_latency = np.max(latencies)
+    std_latency = np.std(latencies)
+
+    return {
+        'avg_latency': avg_latency,
+        'min_latency': min_latency,
+        'max_latency': max_latency,
+        'std_latency': std_latency
+    }
 
 # Define Top 5 Predictions Function
 def get_top5_predictions(model, image_tensor, imagenet_classes):
@@ -123,132 +98,174 @@ def get_top5_predictions(model, image_tensor, imagenet_classes):
         })
     return results
 
-# Define Main Inference Function
-def get_inference_results():
-    """
-    Performs image loading, model loading, warm-up, and top-5 prediction.
-    Stores model and tensor globally for benchmark thread.
-    Benchmarking is now handled separately.
-    Returns a dictionary with prediction results or error information.
-    """
-    global benchmark_status, benchmark_lock, _global_model_for_benchmark, _global_tensor_for_benchmark # Added globals
+class BenchmarkManager:
+    def __init__(self):
+        self.status = 'idle'  # idle, loading, running, complete, error
+        self.progress = 0
+        self.results = None
+        self.error_message = None
+        self.model = None
+        self.image_tensor = None
+        self.lock = threading.Lock()
 
-    preprocessed_image_tensor = load_and_preprocess_image()
-    model = load_model()
+    def _log(self, message):
+        # Simple logger, replace with Flask app logger if available/preferred
+        print(f"[BenchmarkManager] {message}")
 
-    if model is None or preprocessed_image_tensor is None:
-        error_message = "Failed to load model" if model is None else "Failed to load and preprocess image"
-        if model is None and preprocessed_image_tensor is None:
-            error_message = "Failed to load model and image"
-        print(f"Error in get_inference_results: {error_message}")
-        # Update global status if there's an error here that prevents even predictions
-        with benchmark_lock:
-            benchmark_status['status'] = 'error'
-            benchmark_status['error_message'] = error_message
-        # Also ensure global model/tensor are None if there's an error
-        _global_model_for_benchmark = None
-        _global_tensor_for_benchmark = None
-        return {
-            'error': error_message,
-            'top_5_predictions': [],
-            'image_url': IMAGE_URL
-        }
+    def load_resources_if_needed(self):
+        with self.lock: # Ensure thread-safe check and load
+            if self.model and self.image_tensor:
+                self._log("Model and image tensor already loaded.")
+                return True
 
-    # Store model and tensor globally
-    _global_model_for_benchmark = model
-    _global_tensor_for_benchmark = preprocessed_image_tensor
+            # If not loaded, set status to loading
+            self.status = 'loading'
+            self.progress = 0 # Reset progress for loading phase
+            self.error_message = None
 
-    # Perform warm-up runs
-    print("Performing warm-up runs...")
-    for _ in range(5): # Reduced warm-up for quicker UI response, adjust as needed
-        with torch.no_grad():
-            model(preprocessed_image_tensor)
-    print("Warm-up complete.")
+        self._log("Attempting to load model and image tensor...")
+        try:
+            # Temporarily release lock for potentially long I/O operations
+            # This is a design choice: if another request comes, it might also try to load.
+            # A more complex setup might use a dedicated loading lock or ensure only one loading attempt.
 
-    # Get top 5 predictions
-    print("Generating top 5 predictions...")
-    top_5_predictions = get_top5_predictions(model, preprocessed_image_tensor, IMAGENET_CLASSES)
-    print("Top 5 predictions generated.")
+            current_model = load_model() # from app.py global scope
+            current_image_tensor = load_and_preprocess_image() # from app.py global scope
 
-    # Benchmarking is no longer called here directly.
-    # The main results dictionary will not contain latency stats initially.
-    # These will be fetched via the /benchmark_status endpoint.
-    return {
-        'top_5_predictions': top_5_predictions,
-        'image_url': IMAGE_URL,
-        'error': None
-        # No longer returning _model_for_benchmark and _tensor_for_benchmark in dict
-    }
+            with self.lock:
+                if current_model and current_image_tensor:
+                    self.model = current_model
+                    self.image_tensor = current_image_tensor
+                    # Perform warm-up runs after loading model and tensor
+                    self._log("Performing warm-up runs...")
+                    for _ in range(5): # Warm-up runs
+                        with torch.no_grad():
+                            self.model(self.image_tensor)
+                    self._log("Warm-up complete.")
+                    # If status was 'loading', reset to 'idle' as resources are ready for benchmark/prediction
+                    if self.status == 'loading':
+                        self.status = 'idle'
+                    self._log("Model and image tensor loaded successfully.")
+                    return True
+                else:
+                    self.model = None
+                    self.image_tensor = None
+                    error_msg = "Failed to load model or image tensor."
+                    if not current_model: error_msg += " Model loading failed."
+                    if not current_image_tensor: error_msg += " Image tensor loading failed."
+                    self.error_message = error_msg
+                    self.status = 'error'
+                    self._log(error_msg)
+                    return False
+        except Exception as e:
+            with self.lock:
+                self.model = None
+                self.image_tensor = None
+                self.error_message = f"Exception during resource loading: {str(e)}"
+                self.status = 'error'
+                self._log(self.error_message)
+            return False
 
-# Removed global population of inference_results
-# MODEL = None # Removed
-# PREPROCESSED_IMAGE_TENSOR = None # Removed
-# TOP_5_PREDICTIONS = [] # Removed
-# AVG_LATENCY, MIN_LATENCY, MAX_LATENCY, STD_LATENCY = None, None, None, None # Removed
+    def get_initial_predictions(self):
+        self._log("Getting initial predictions...")
+        if not self.load_resources_if_needed():
+            with self.lock: # Read consistent error state
+                return {'error': self.error_message, 'top_5_predictions': [], 'image_url': IMAGE_URL}
 
-def _run_benchmark_thread():
-    """Wrapper function to run benchmark_inference in a thread and update status."""
-    global benchmark_status, benchmark_lock, _global_model_for_benchmark, _global_tensor_for_benchmark
+        if not self.model or not self.image_tensor: # Should be caught by load_resources_if_needed
+            return {'error': "Model/Tensor not available after load attempt.", 'top_5_predictions': [], 'image_url': IMAGE_URL}
 
-    if not _global_model_for_benchmark or not _global_tensor_for_benchmark:
-        print("Error: Model or tensor not available for benchmarking.")
-        with benchmark_lock:
-            benchmark_status['status'] = 'error'
-            benchmark_status['error_message'] = 'Model or tensor not loaded for benchmark.'
-        return
+        self._log("Generating top 5 predictions...")
+        # get_top5_predictions is still a global function in app.py
+        predictions = get_top5_predictions(self.model, self.image_tensor, IMAGENET_CLASSES)
+        self._log("Top 5 predictions generated.")
+        return {'error': None, 'top_5_predictions': predictions, 'image_url': IMAGE_URL}
 
-    try:
-        print("Benchmark thread started...")
-        # benchmark_inference will update progress and results internally using global benchmark_status
-        benchmark_inference(_global_model_for_benchmark, _global_tensor_for_benchmark)
-        with benchmark_lock:
-            if benchmark_status['status'] != 'error': # Don't override error status if benchmark_inference set it
-                benchmark_status['status'] = 'complete'
-        print("Benchmark thread finished.")
-    except Exception as e:
-        print(f"Exception in benchmark thread: {e}")
-        with benchmark_lock:
-            benchmark_status['status'] = 'error'
-            benchmark_status['error_message'] = str(e)
+    def _update_progress_callback(self, current_percentage):
+        with self.lock:
+            if self.status == 'running': # Only update if still in running state
+                self.progress = current_percentage
+
+    def _perform_benchmark_and_update_status(self):
+        self._log("Benchmark thread started.")
+        try:
+            # benchmark_inference is now the refactored global function in app.py
+            latency_results = benchmark_inference(self.model, self.image_tensor, self._update_progress_callback)
+            with self.lock:
+                self.results = latency_results
+                self.status = 'complete'
+                self.progress = 100 # Ensure progress is 100% on completion
+                self._log("Benchmark completed successfully.")
+        except Exception as e:
+            self._log(f"Exception in benchmark thread: {str(e)}")
+            with self.lock:
+                self.status = 'error'
+                self.error_message = str(e)
+                self.results = None # Clear any partial results
+
+    def start_benchmark(self):
+        self._log("Attempting to start benchmark...")
+        with self.lock:
+            if self.status == 'running' or self.status == 'loading':
+                self._log(f"Cannot start benchmark, current status: {self.status}")
+                return {'message': f'Benchmark process is already active ({self.status}). Please wait.'}, False
+
+            # Attempt to load resources first if not already loaded
+            # This call will acquire and release the lock internally
+
+        if not self.load_resources_if_needed(): # This method handles its own logging and status updates on failure
+            self._log("Resource loading failed prior to starting benchmark.")
+            # get_status() will reflect the error from load_resources_if_needed
+            return {'message': 'Failed to load resources for benchmarking.', 'error': self.error_message}, False
+
+        # Now proceed with starting the benchmark thread
+        with self.lock:
+            self.status = 'running'
+            self.progress = 0
+            self.results = None
+            self.error_message = None
+            self._log("Benchmark status set to 'running'. Starting thread.")
+
+        thread = threading.Thread(target=self._perform_benchmark_and_update_status)
+        thread.daemon = True
+        thread.start()
+
+        return {'message': 'Benchmark started.'}, True
+
+    def get_status(self):
+        with self.lock:
+            # Return a copy to prevent modification of internal state if the dict is manipulated by caller
+            return {
+                'status': self.status,
+                'progress': self.progress,
+                'results': self.results,
+                'error_message': self.error_message
+            }
+
+# Global instance of the manager
+benchmark_manager = BenchmarkManager()
 
 @app.route('/start_benchmark', methods=['POST'])
 def start_benchmark_route():
-    global benchmark_status, benchmark_lock, _global_model_for_benchmark, _global_tensor_for_benchmark
-
-    with benchmark_lock:
-        if benchmark_status['status'] == 'running':
-            return jsonify({'message': 'Benchmark is already running.'}), 409 # Conflict
-
-        # Reset status for a new run
-        benchmark_status['status'] = 'running'
-        benchmark_status['progress'] = 0
-        benchmark_status['results'] = None
-        benchmark_status['error_message'] = None
-
-    # The _global_model_for_benchmark and _global_tensor_for_benchmark
-    # are expected to be populated by the initial call to get_inference_results()
-    # from the main '/' route. This is a design choice from the previous step.
-    # If they are not populated, the _run_benchmark_thread will handle it.
-
-    thread = threading.Thread(target=_run_benchmark_thread)
-    thread.daemon = True # Allows main program to exit even if threads are still running
-    thread.start()
-
-    return jsonify({'message': 'Benchmark started.'})
+    message, success = benchmark_manager.start_benchmark()
+    if success:
+        return jsonify(message), 200
+    else:
+        # Consider appropriate status code for failure to start
+        # 409 (Conflict) if already running/loading, 500 or 503 if resource loading failed
+        status_code = 409 if benchmark_manager.get_status()['status'] in ['running', 'loading'] else 503
+        return jsonify(message), status_code
 
 @app.route('/benchmark_status')
 def benchmark_status_route():
-    global benchmark_status, benchmark_lock
-    with benchmark_lock:
-        # Make a copy to avoid issues if the status is updated while sending response
-        status_copy = dict(benchmark_status)
-    return jsonify(status_copy)
+    return jsonify(benchmark_manager.get_status())
 
 @app.route('/')
 def index():
-    results = get_inference_results() # This loads model/tensor globally and gets initial predictions
+    # Use the manager to get initial predictions
+    results = benchmark_manager.get_initial_predictions()
 
-    current_image_url = results.get('image_url', IMAGE_URL)
+    current_image_url = results.get('image_url', IMAGE_URL) # IMAGE_URL is still a global constant
     predictions_html = ""
 
     if results.get('error') and not results.get('top_5_predictions'):
