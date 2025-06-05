@@ -1,21 +1,29 @@
 import unittest
 from unittest.mock import patch, MagicMock
+import time
+import threading # Added for testing thread creation
 
 from flask import Flask
-from PIL import Image as PILImage # Renamed to avoid conflict if Image is used elsewhere directly
+from PIL import Image as PILImage
 import torch
 import requests # For requests.exceptions.RequestException
 from io import BytesIO
 
 # Assuming app.py and constants.py are in the same directory or accessible via PYTHONPATH
-from app import app, load_and_preprocess_image, load_model, get_inference_results
+from app import app # Flask app instance
+import app as main_app # The app module itself
 from constants import IMAGENET_CLASSES, IMAGE_URL
 
 class TestApp(unittest.TestCase):
 
     def setUp(self):
-        app.testing = True
+        app.testing = True # app is the Flask app instance
         self.client = app.test_client()
+        # Create a new manager instance for each test to ensure isolation
+        main_app.benchmark_manager = main_app.BenchmarkManager()
+        # It's also good practice to ensure the manager's internal model/tensor are reset
+        main_app.benchmark_manager.model = None
+        main_app.benchmark_manager.image_tensor = None
 
     def test_example(self):
         """A placeholder test to ensure the structure is valid."""
@@ -84,180 +92,274 @@ class TestApp(unittest.TestCase):
         # Assertions
         self.assertIsNone(model)
 
-    @patch('app.get_top5_predictions')
-    @patch('app.benchmark_inference')
+    # Tests for standalone utility functions (load_model, load_and_preprocess_image)
+    # These are largely unchanged as the functions they test were not removed from app.py
+
+    # --- Tests for BenchmarkManager ---
+    def test_bm_initial_state(self):
+        manager = main_app.BenchmarkManager()
+        self.assertEqual(manager.status, 'idle')
+        self.assertEqual(manager.progress, 0)
+        self.assertIsNone(manager.results)
+        self.assertIsNone(manager.error_message)
+        self.assertIsNone(manager.model)
+        self.assertIsNone(manager.image_tensor)
+
     @patch('app.load_model')
     @patch('app.load_and_preprocess_image')
-    def test_get_inference_results_success(self, mock_load_image, mock_load_model, mock_benchmark, mock_get_preds):
-        """Test successful run of get_inference_results."""
-        mock_tensor = MagicMock(spec=torch.Tensor)
-        mock_load_image.return_value = mock_tensor
-
+    def test_bm_load_resources_if_needed_success(self, mock_load_image, mock_load_model):
         mock_model_instance = MagicMock()
         mock_load_model.return_value = mock_model_instance
+        mock_tensor_instance = MagicMock()
+        mock_load_image.return_value = mock_tensor_instance
 
-        mock_latencies = (10.0, 5.0, 15.0, 1.0)
-        mock_benchmark.return_value = mock_latencies
+        manager = main_app.BenchmarkManager()
+        loaded = manager.load_resources_if_needed()
 
-        mock_predictions = [{'name': 'mock_cat', 'prob': 0.9}]
-        mock_get_preds.return_value = mock_predictions
+        self.assertTrue(loaded)
+        self.assertEqual(manager.status, 'idle') # Should be idle after loading and warmup
+        self.assertEqual(manager.model, mock_model_instance)
+        self.assertEqual(manager.image_tensor, mock_tensor_instance)
+        mock_load_model.assert_called_once()
+        mock_load_image.assert_called_once()
+        self.assertEqual(mock_model_instance.call_count, 5) # 5 warm-up calls
 
-        results = get_inference_results()
+    @patch('app.load_model', return_value=None)
+    @patch('app.load_and_preprocess_image')
+    def test_bm_load_resources_if_needed_model_fail(self, mock_load_image, mock_load_model):
+        mock_load_image.return_value = MagicMock() # Image load succeeds
+        manager = main_app.BenchmarkManager()
+        loaded = manager.load_resources_if_needed()
+
+        self.assertFalse(loaded)
+        self.assertEqual(manager.status, 'error')
+        self.assertIn("Model loading failed", manager.error_message)
+        self.assertIsNone(manager.model)
+
+    @patch('app.load_model')
+    @patch('app.load_and_preprocess_image', return_value=None)
+    def test_bm_load_resources_if_needed_image_fail(self, mock_load_image, mock_load_model):
+        mock_load_model.return_value = MagicMock() # Model load succeeds
+        manager = main_app.BenchmarkManager()
+        loaded = manager.load_resources_if_needed()
+
+        self.assertFalse(loaded)
+        self.assertEqual(manager.status, 'error')
+        self.assertIn("Image tensor loading failed", manager.error_message)
+        self.assertIsNone(manager.image_tensor)
+
+    @patch('app.load_model')
+    @patch('app.load_and_preprocess_image')
+    def test_bm_load_resources_if_needed_already_loaded(self, mock_load_image, mock_load_model):
+        manager = main_app.BenchmarkManager()
+        manager.model = MagicMock()
+        manager.image_tensor = MagicMock()
+
+        loaded = manager.load_resources_if_needed()
+        self.assertTrue(loaded)
+        mock_load_image.assert_not_called()
+        mock_load_model.assert_not_called()
+
+    @patch('app.get_top5_predictions')
+    def test_bm_get_initial_predictions_success(self, mock_get_top5):
+        manager = main_app.BenchmarkManager()
+        manager.model = MagicMock() # Assume loaded
+        manager.image_tensor = MagicMock() # Assume loaded
+        mock_preds = [{'name': 'cat', 'prob': 0.9}]
+        mock_get_top5.return_value = mock_preds
+
+        with patch.object(manager, 'load_resources_if_needed', return_value=True):
+            results = manager.get_initial_predictions()
 
         self.assertIsNone(results['error'])
-        self.assertEqual(results['top_5_predictions'], mock_predictions)
-        self.assertEqual(results['avg_latency'], mock_latencies[0])
-        self.assertEqual(results['min_latency'], mock_latencies[1])
-        self.assertEqual(results['max_latency'], mock_latencies[2])
-        self.assertEqual(results['std_latency'], mock_latencies[3])
-        self.assertEqual(results['image_url'], IMAGE_URL)
+        self.assertEqual(results['top_5_predictions'], mock_preds)
+        mock_get_top5.assert_called_once_with(manager.model, manager.image_tensor, main_app.IMAGENET_CLASSES)
 
-        mock_load_image.assert_called_once()
-        mock_load_model.assert_called_once()
+    def test_bm_get_initial_predictions_load_fail(self):
+        manager = main_app.BenchmarkManager()
+        with patch.object(manager, 'load_resources_if_needed', return_value=False) as mock_load:
+            manager.error_message = "Resource load failed" # Simulate error set by load_resources
+            results = manager.get_initial_predictions()
 
-        # Check warm-up calls: model(tensor) is called 5 times
-        # MagicMock records calls to itself.
-        # The model is also called by benchmark_inference and get_top5_predictions.
-        # We are primarily interested in the 5 warm-up calls.
-        # mock_model_instance.assert_any_call(mock_tensor) # Check it was called with the tensor
-
-        # Count calls to the model instance with the mock_tensor.
-        # The first 5 calls should be the warm-up calls.
-        # Then benchmark_inference calls it 1000 times.
-        # Then get_top5_predictions calls it once.
-        # So, total calls to model_instance(mock_tensor) = 5 (warmup) + 1000 (benchmark) + 1 (preds)
-        # For simplicity in this unit test, we'll check the direct helper calls.
-        # Verifying the exact number of warm-up calls on the mock_model_instance
-        # can be tricky if other parts of the code also call it.
-        # However, the prompt asks for it.
-        # The model itself is called, so mock_model_instance is the callable.
-
-        # Check that the model was called with the tensor at least 5 times for warm-up
-        # This is a bit indirect. A more direct way would be to check call_args_list
-        # call_list = mock_model_instance.call_args_list
-        # warmup_calls = [call for call in call_list if call == unittest.mock.call(mock_tensor)]
-        # self.assertGreaterEqual(len(warmup_calls), 5)
-        # For now, let's check the count of calls to the mocked model object itself.
-        # The model is called 5 times in warmup, 1000 times in benchmark, 1 time in get_top5
-        # Total expected calls = 5 (warmup) + 1000 (benchmark_inference internal) + 1 (get_top5_predictions internal)
-        # The mock_model_instance is the model itself.
-        # The benchmark_inference and get_top5_predictions are separate mocks here.
-        # So we only expect the 5 warm-up calls on the *mock_model_instance* directly from get_inference_results.
-        self.assertEqual(mock_model_instance.call_count, 5, "Model should be called 5 times for warm-up.")
-
-
-        mock_benchmark.assert_called_once_with(mock_model_instance, mock_tensor)
-        mock_get_preds.assert_called_once_with(mock_model_instance, mock_tensor, IMAGENET_CLASSES)
-
-
-    @patch('app.load_model')
-    @patch('app.load_and_preprocess_image')
-    def test_get_inference_results_image_load_failure(self, mock_load_image, mock_load_model):
-        """Test get_inference_results when image loading fails."""
-        mock_load_image.return_value = None
-        mock_load_model.return_value = MagicMock() # Model loading succeeds
-
-        results = get_inference_results()
-
+        mock_load.assert_called_once()
         self.assertIsNotNone(results['error'])
-        self.assertIn("Failed to load and preprocess image", results['error'])
+        self.assertEqual(results['error'], "Resource load failed")
         self.assertEqual(results['top_5_predictions'], [])
-        self.assertIsNone(results['avg_latency'])
-        self.assertIsNone(results['min_latency'])
-        self.assertIsNone(results['max_latency'])
-        self.assertIsNone(results['std_latency'])
 
-    @patch('app.load_model')
-    @patch('app.load_and_preprocess_image')
-    def test_get_inference_results_model_load_failure(self, mock_load_image, mock_load_model):
-        """Test get_inference_results when model loading fails."""
-        mock_load_image.return_value = MagicMock(spec=torch.Tensor) # Image loading succeeds
-        mock_load_model.return_value = None
+    @patch('threading.Thread')
+    def test_bm_start_benchmark_success(self, mock_thread_constructor):
+        manager = main_app.BenchmarkManager()
+        manager.model = MagicMock() # Pre-load
+        manager.image_tensor = MagicMock() # Pre-load
+        mock_thread_instance = MagicMock()
+        mock_thread_constructor.return_value = mock_thread_instance
 
-        results = get_inference_results()
+        with patch.object(manager, 'load_resources_if_needed', return_value=True):
+            message, success = manager.start_benchmark()
 
-        self.assertIsNotNone(results['error'])
-        self.assertIn("Failed to load model", results['error'])
-        self.assertEqual(results['top_5_predictions'], [])
-        self.assertIsNone(results['avg_latency'])
-        self.assertIsNone(results['min_latency'])
-        self.assertIsNone(results['max_latency'])
-        self.assertIsNone(results['std_latency'])
+        self.assertTrue(success)
+        self.assertEqual(message['message'], 'Benchmark started.')
+        self.assertEqual(manager.status, 'running')
+        self.assertEqual(manager.progress, 0)
+        self.assertIsNone(manager.results)
+        self.assertIsNone(manager.error_message)
+        mock_thread_constructor.assert_called_once_with(target=manager._perform_benchmark_and_update_status)
+        mock_thread_instance.start.assert_called_once()
+        self.assertTrue(mock_thread_instance.daemon)
 
-    @patch('app.load_model')
-    @patch('app.load_and_preprocess_image')
-    def test_get_inference_results_both_load_failure(self, mock_load_image, mock_load_model):
-        """Test get_inference_results when both image and model loading fail."""
-        mock_load_image.return_value = None
-        mock_load_model.return_value = None
 
-        results = get_inference_results()
+    def test_bm_start_benchmark_already_active(self):
+        manager = main_app.BenchmarkManager()
+        manager.status = 'running'
+        message, success = manager.start_benchmark()
+        self.assertFalse(success)
+        self.assertIn('already active', message['message'])
 
-        self.assertIsNotNone(results['error'])
-        self.assertIn("Failed to load model and image", results['error']) # Check for specific combined message
-        self.assertEqual(results['top_5_predictions'], [])
-        self.assertIsNone(results['avg_latency'])
-        self.assertIsNone(results['min_latency'])
-        self.assertIsNone(results['max_latency'])
-        self.assertIsNone(results['std_latency'])
+        manager.status = 'loading'
+        message, success = manager.start_benchmark()
+        self.assertFalse(success)
+        self.assertIn('already active', message['message'])
 
-    @patch('app.get_inference_results')
-    def test_index_route_success(self, mock_get_results):
-        """Test the index route with a successful inference result."""
+    def test_bm_start_benchmark_load_fail(self):
+        manager = main_app.BenchmarkManager()
+        with patch.object(manager, 'load_resources_if_needed', return_value=False) as mock_load:
+            manager.error_message = "Load error" # Simulate error from loading
+            message, success = manager.start_benchmark()
+
+        self.assertFalse(success)
+        self.assertEqual(message['message'], 'Failed to load resources for benchmarking.')
+        self.assertEqual(message['error'], 'Load error')
+        mock_load.assert_called_once()
+
+    @patch('app.benchmark_inference') # Patch the global benchmark_inference in app.py
+    def test_bm_perform_benchmark_and_update_status_success(self, mock_bi_func):
+        manager = main_app.BenchmarkManager()
+        manager.model = MagicMock()
+        manager.image_tensor = MagicMock()
+        latency_data = {'avg_latency': 10.0, 'min_latency': 5.0}
+        mock_bi_func.return_value = latency_data
+
+        manager._perform_benchmark_and_update_status()
+
+        self.assertEqual(manager.status, 'complete')
+        self.assertEqual(manager.results, latency_data)
+        self.assertEqual(manager.progress, 100)
+        mock_bi_func.assert_called_once_with(manager.model, manager.image_tensor, manager._update_progress_callback)
+
+    @patch('app.benchmark_inference', side_effect=Exception("Benchmark func error"))
+    def test_bm_perform_benchmark_and_update_status_exception(self, mock_bi_func_exception):
+        manager = main_app.BenchmarkManager()
+        manager.model = MagicMock()
+        manager.image_tensor = MagicMock()
+
+        manager._perform_benchmark_and_update_status()
+
+        self.assertEqual(manager.status, 'error')
+        self.assertEqual(manager.error_message, "Benchmark func error")
+        self.assertIsNone(manager.results)
+        mock_bi_func_exception.assert_called_once_with(manager.model, manager.image_tensor, manager._update_progress_callback)
+
+    def test_bm_update_progress_callback(self):
+        manager = main_app.BenchmarkManager()
+        manager.status = 'running' # Must be running to accept progress
+        manager._update_progress_callback(50)
+        self.assertEqual(manager.progress, 50)
+
+        manager.status = 'complete' # Should not update if not running
+        manager._update_progress_callback(75)
+        self.assertEqual(manager.progress, 50) # Progress should remain 50
+
+    # --- Test for refactored benchmark_inference ---
+    def test_benchmark_inference_logic(self):
+        mock_model = MagicMock()
+        mock_tensor = MagicMock()
+        mock_progress_callback = MagicMock()
+
+        results = main_app.benchmark_inference(mock_model, mock_tensor, mock_progress_callback)
+
+        self.assertIn('avg_latency', results)
+        self.assertIsInstance(results['avg_latency'], float)
+        # Check that model was called 1000 times
+        self.assertEqual(mock_model.call_count, 1000)
+        # Check progress callback was called, e.g., last call should be 100
+        mock_progress_callback.assert_called_with(100)
+        self.assertGreaterEqual(mock_progress_callback.call_count, 1000) # Called for each iteration
+
+        with self.assertRaises(ValueError):
+            main_app.benchmark_inference(None, mock_tensor, mock_progress_callback)
+        with self.assertRaises(ValueError):
+            main_app.benchmark_inference(mock_model, None, mock_progress_callback)
+
+
+    # --- Route Tests (Refactored) ---
+    @patch('app.main_app.benchmark_manager.get_initial_predictions')
+    def test_index_route_initial_load_modified(self, mock_get_initial_predictions):
         mock_data = {
             'top_5_predictions': [{'name': 'TestCat', 'prob': 0.9876}],
-            'avg_latency': 123.45,
-            'min_latency': 100.0,
-            'max_latency': 150.0,
-            'std_latency': 10.0,
             'image_url': 'http://example.com/test_image.jpg',
             'error': None
         }
-        mock_get_results.return_value = mock_data
+        mock_get_initial_predictions.return_value = mock_data
 
         response = self.client.get('/')
         response_data = response.data.decode('utf-8')
 
         self.assertEqual(response.status_code, 200)
-        mock_get_results.assert_called_once() # Ensure get_inference_results was called
-
+        mock_get_initial_predictions.assert_called_once()
         self.assertIn('TestCat', response_data)
-        self.assertIn('98.7600%', response_data) # Check formatted probability
-        self.assertIn('123.45 ms', response_data)
-        self.assertIn('100.00 ms', response_data) # min_latency
-        self.assertIn('150.00 ms', response_data) # max_latency
-        self.assertIn('10.00 ms', response_data) # std_latency
+        self.assertIn('98.7600%', response_data)
         self.assertIn('http://example.com/test_image.jpg', response_data)
-        self.assertNotIn('Error:', response_data) # Error message should not be present
+        self.assertIn('<button id="startBenchmarkButton"', response_data)
+        self.assertIn("N/A (Run benchmark)", response_data)
 
-    @patch('app.get_inference_results')
-    def test_index_route_with_error_from_get_inference_results(self, mock_get_results):
-        """Test the index route when get_inference_results returns an error."""
-        error_message = 'Simulated error during inference'
+    @patch('app.main_app.benchmark_manager.get_initial_predictions')
+    def test_index_route_with_error_from_get_inference_results_modified(self, mock_get_initial_predictions):
+        error_message = 'Simulated error during initial predictions'
         mock_data = {
             'top_5_predictions': [],
-            'avg_latency': None,
-            'min_latency': None,
-            'max_latency': None,
-            'std_latency': None,
-            'image_url': IMAGE_URL, # Use the actual constant for consistency
+            'image_url': main_app.IMAGE_URL,
             'error': error_message
         }
-        mock_get_results.return_value = mock_data
+        mock_get_initial_predictions.return_value = mock_data
 
         response = self.client.get('/')
         response_data = response.data.decode('utf-8')
 
         self.assertEqual(response.status_code, 200)
-        mock_get_results.assert_called_once()
+        mock_get_initial_predictions.assert_called_once()
+        self.assertIn(f"Error fetching initial predictions: {error_message}", response_data)
+        self.assertIn("Average Latency: <span id=\"avgLatency\">N/A (Run benchmark)</span>", response_data)
 
-        self.assertIn(f"Error: {error_message}", response_data)
-        # Check for N/A for latency values
-        self.assertIn("Average Latency: N/A", response_data)
-        self.assertIn("Minimum Latency: N/A", response_data)
-        self.assertIn("Maximum Latency: N/A", response_data)
-        self.assertIn("Standard Deviation: N/A", response_data)
-        self.assertIn(IMAGE_URL, response_data) # Check that the image URL is still displayed
+    @patch('app.main_app.benchmark_manager.start_benchmark')
+    def test_start_benchmark_route_success(self, mock_start_benchmark):
+        mock_start_benchmark.return_value = ({'message': 'Benchmark started.'}, True)
+        response = self.client.post('/start_benchmark')
+        self.assertEqual(response.status_code, 200)
+        data = response.get_json()
+        self.assertEqual(data['message'], 'Benchmark started.')
+        mock_start_benchmark.assert_called_once()
+
+    @patch('app.main_app.benchmark_manager.start_benchmark')
+    def test_start_benchmark_route_already_running(self, mock_start_benchmark):
+        mock_start_benchmark.return_value = ({'message': 'Benchmark process is already active (running). Please wait.'}, False)
+        # Simulate manager being in 'running' state for status code decision in route
+        with patch.object(main_app.benchmark_manager, 'get_status', return_value={'status': 'running'}):
+            response = self.client.post('/start_benchmark')
+        self.assertEqual(response.status_code, 409)
+        data = response.get_json()
+        self.assertIn('already active', data['message'])
+        mock_start_benchmark.assert_called_once()
+
+    @patch('app.main_app.benchmark_manager.get_status')
+    def test_benchmark_status_route(self, mock_get_status):
+        mock_status_data = {'status': 'running', 'progress': 50, 'results': None, 'error_message': None}
+        mock_get_status.return_value = mock_status_data
+
+        response = self.client.get('/benchmark_status')
+        self.assertEqual(response.status_code, 200)
+        data = response.get_json()
+        self.assertEqual(data, mock_status_data)
+        mock_get_status.assert_called_once()
 
 if __name__ == '__main__':
     unittest.main()
