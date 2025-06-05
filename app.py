@@ -258,7 +258,61 @@ def start_benchmark_route():
 
 @app.route('/benchmark_status')
 def benchmark_status_route():
-    return jsonify(benchmark_manager.get_status())
+    try:
+        # Ensure app.logger is available and configured.
+        # For basic Flask apps, app.logger is available after app creation.
+        # If running this snippet standalone, app.logger might need explicit setup,
+        # but in the context of the existing app.py, it should be fine.
+
+        status_data = benchmark_manager.get_status()
+
+        # Log the data before jsonify
+        # Use a print statement for simplicity if app.logger is problematic in the subtask environment,
+        # but app.logger is preferred for Flask apps.
+        print(f"INFO: Raw status data from BenchmarkManager: {status_data}")
+        # Fallback to print if app.logger is not configured in this execution context:
+        # try:
+        #     app.logger.info(f"Raw status data from BenchmarkManager: {status_data}")
+        # except AttributeError: # pragma: no cover
+        #     print(f"INFO: Raw status data from BenchmarkManager: {status_data}")
+
+
+        if not isinstance(status_data, dict):
+            error_msg = f"BenchmarkManager.get_status() returned non-dict type: {type(status_data)}, value: {status_data}"
+            print(f"ERROR: {error_msg}")
+            # try:
+            #    app.logger.error(error_msg)
+            # except AttributeError: # pragma: no cover
+            #    print(f"ERROR: {error_msg}")
+            return jsonify({'error': 'Internal server error: Invalid status data format', 'status': 'error'}), 500
+
+        if 'status' not in status_data:
+            error_msg = f"Key 'status' is missing from BenchmarkManager status_data: {status_data}"
+            print(f"ERROR: {error_msg}")
+            # try:
+            #    app.logger.error(error_msg)
+            # except AttributeError: # pragma: no cover
+            #    print(f"ERROR: {error_msg}")
+
+            # Defensively add status and error message
+            status_data['status'] = 'error'
+            status_data['error_message'] = str(status_data.get('error_message', '')) + " [System Error: Status key was missing from server data]"
+            # Also ensure other essential keys for JS are present if status is error
+            status_data.setdefault('progress', 0)
+            status_data.setdefault('results', None)
+
+
+        return jsonify(status_data)
+    except Exception as e:
+        # Log stack trace
+        import traceback
+        error_details = f"Error in /benchmark_status route: {str(e)}\n{traceback.format_exc()}"
+        print(f"ERROR: {error_details}")
+        # try:
+        #    app.logger.error(f"Error in /benchmark_status route: {str(e)}", exc_info=True)
+        # except AttributeError: # pragma: no cover
+        #    print(f"ERROR: Error in /benchmark_status route: {str(e)}\n{traceback.format_exc()}")
+        return jsonify({'error': 'Internal server error while fetching status', 'details': str(e), 'status': 'error'}), 500
 
 @app.route('/')
 def index():
@@ -413,6 +467,16 @@ def index():
                     }})
                     .then(data => {{
                         console.log('Status update:', data); // For debugging
+                        if (!data || typeof data.status === 'undefined') {
+                            console.error('Invalid or incomplete status data received:', data);
+                            statusMessage.textContent = 'Error: Received invalid status data from server.';
+                            statusMessage.style.color = 'red';
+                            if (benchmarkInterval) clearInterval(benchmarkInterval);
+                            button.disabled = false;
+                            button.textContent = 'Start Benchmark'; // Or 'Re-run Benchmark' if appropriate
+                            progressBarContainer.style.display = 'none';
+                            return;
+                        }
                         if (data.status === 'running') {{
                             progressBar.style.width = data.progress + '%';
                             progressBar.textContent = data.progress + '%';
