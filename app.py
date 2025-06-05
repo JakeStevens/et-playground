@@ -52,7 +52,7 @@ def benchmark_inference(model, image_tensor, progress_callback):
     latencies = []
     total_iterations = 1000
 
-    if not model or not image_tensor:
+    if model is None or image_tensor is None:
         raise ValueError("Model or image tensor not provided to benchmark_inference")
 
     for i in range(total_iterations):
@@ -114,7 +114,7 @@ class BenchmarkManager:
 
     def load_resources_if_needed(self):
         with self.lock: # Ensure thread-safe check and load
-            if self.model and self.image_tensor:
+            if self.model is not None and self.image_tensor is not None:
                 self._log("Model and image tensor already loaded.")
                 return True
 
@@ -133,7 +133,7 @@ class BenchmarkManager:
             current_image_tensor = load_and_preprocess_image() # from app.py global scope
 
             with self.lock:
-                if current_model and current_image_tensor:
+                if current_model is not None and current_image_tensor is not None:
                     self.model = current_model
                     self.image_tensor = current_image_tensor
                     # Perform warm-up runs after loading model and tensor
@@ -172,7 +172,7 @@ class BenchmarkManager:
             with self.lock: # Read consistent error state
                 return {'error': self.error_message, 'top_5_predictions': [], 'image_url': IMAGE_URL}
 
-        if not self.model or not self.image_tensor: # Should be caught by load_resources_if_needed
+        if self.model is None or self.image_tensor is None: # Should be caught by load_resources_if_needed
             return {'error': "Model/Tensor not available after load attempt.", 'top_5_predictions': [], 'image_url': IMAGE_URL}
 
         self._log("Generating top 5 predictions...")
@@ -424,10 +424,10 @@ def index():
                         if (!response.ok) {{
                             // Try to parse error message from server if available
                             return response.json().then(err => {{
-                                throw new Error(err.message || `Server error: ${response.status}`);
+                                throw new Error(err.message || `Server error: ${{response.status}}`);
                             }}).catch(() => {{
                                 // Fallback if parsing error message fails
-                                throw new Error(`Server error: ${response.status}`);
+                                throw new Error(`Server error: ${{response.status}}`);
                             }});
                         }}
                         return response.json();
@@ -458,16 +458,16 @@ def index():
                     .then(response => {{
                          if (!response.ok) {{
                             return response.json().then(err => {{
-                                throw new Error(err.message || `Server error: ${response.status}`);
+                                throw new Error(err.message || `Server error: ${{response.status}}`);
                             }}).catch(() => {{
-                                throw new Error(`Server error: ${response.status}`);
+                                throw new Error(`Server error: ${{response.status}}`);
                             }});
                         }}
                         return response.json();
                     }})
                     .then(data => {{
                         console.log('Status update:', data); // For debugging
-                        if (!data || typeof data.status === 'undefined') {
+                        if (!data || typeof data.status === 'undefined') {{
                             console.error('Invalid or incomplete status data received:', data);
                             statusMessage.textContent = 'Error: Received invalid status data from server.';
                             statusMessage.style.color = 'red';
@@ -476,7 +476,7 @@ def index():
                             button.textContent = 'Start Benchmark'; // Or 'Re-run Benchmark' if appropriate
                             progressBarContainer.style.display = 'none';
                             return;
-                        }
+                        }}
                         if (data.status === 'running') {{
                             progressBar.style.width = data.progress + '%';
                             progressBar.textContent = data.progress + '%';
