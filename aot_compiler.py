@@ -51,33 +51,6 @@ def compile_model_to_executorch(
         print("  Exporting model for quantization preparation...")
         exported_program_for_quant_prep = export(model, example_inputs) # Use original model here
 
-        # Applying necessary patches to ExportedProgram for quantization to proceed
-        # These were identified as necessary in previous attempts for torch 2.7 + exir 0.6
-        if hasattr(exported_program_for_quant_prep, 'graph_module') and \
-           hasattr(exported_program_for_quant_prep.graph_module, 'meta') and \
-           not hasattr(exported_program_for_quant_prep, 'meta'):
-            print("    Patching: Assigning graph_module.meta to exported_program_for_quant_prep.meta")
-            exported_program_for_quant_prep.meta = exported_program_for_quant_prep.graph_module.meta
-        elif not hasattr(exported_program_for_quant_prep, 'meta'):
-            print("    Patching: exported_program_for_quant_prep.meta is missing and graph_module.meta is also not available. Setting meta to empty dict.")
-            exported_program_for_quant_prep.meta = {}
-
-        if not hasattr(exported_program_for_quant_prep, 'recompile'):
-            print("    Patching: Adding a dummy recompile method to exported_program_for_quant_prep.")
-            def _dummy_recompile_patch(self_ep, *args, **kwargs): # Renamed self to self_ep to avoid class method issues
-                # print("      Dummy recompile called on ExportedProgram.")
-                return self_ep # Return the ExportedProgram instance itself
-            # Bind this as a method to the instance
-            exported_program_for_quant_prep.recompile = types.MethodType(_dummy_recompile_patch, exported_program_for_quant_prep)
-
-
-        if not hasattr(exported_program_for_quant_prep, 'named_modules') and \
-           hasattr(exported_program_for_quant_prep, 'graph_module'):
-            print("    Patching: Assigning graph_module.named_modules to exported_program_for_quant_prep.named_modules")
-            exported_program_for_quant_prep.named_modules = exported_program_for_quant_prep.graph_module.named_modules
-        elif not hasattr(exported_program_for_quant_prep, 'named_modules'):
-            print("    Patching: exported_program_for_quant_prep.named_modules is missing and graph_module is not available. Cannot patch.")
-
         print("  Preparing model for quantization (prepare_pt2e)...")
         try:
             prepared_model = prepare_pt2e(exported_program_for_quant_prep, quantizer)
@@ -161,22 +134,5 @@ if __name__ == "__main__":
         print(f"Compilation without quantization successful.")
     except Exception as e:
         print(f"An error occurred during non-quantized compilation: {e}")
-
-    # Example: Attempt to compile WITH quantization
-    output_filename_quant = "aot_model_xnnpack_quant_main_attempt.pte" # Different name for main run
-    print(f"\nAttempting compilation WITH quantization to {output_filename_quant}")
-    try:
-        # Create a fresh model instance for the quantization attempt
-        # as the model might be mutated by the export process or patches
-        simple_model_for_quant = SimpleModel()
-        compile_model_to_executorch(
-            simple_model_for_quant,
-            dummy_inputs,
-            output_filename_quant,
-            enable_quantization=True
-        )
-        print(f"Compilation with quantization successful (unexpected).")
-    except Exception as e:
-        print(f"An error occurred during quantized compilation: {e}") # Expected to see the KeyError here
 
     print("\nAOT Compiler Script finished.")
