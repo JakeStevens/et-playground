@@ -1001,4 +1001,4 @@ IMAGENET_CLASSES = [
     'toilet tissue, toilet paper, bathroom tissue'
 ]
 
-IMAGE_URL = "https://upload.wikimedia.org/wikipedia/commons/thumb/4/43/Cat_poster_1.jpg/220px-Cat_poster_1.jpg"
+IMAGE_URL = "https://upload.wikimedia.org/wikipedia/commons/thumb/d/d7/Asian_Golden_cat.jpg/250px-Asian_Golden_cat.jpg"
