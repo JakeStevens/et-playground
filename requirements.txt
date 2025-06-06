@@ -1,5 +1,7 @@
 Flask
-torch
+torch==2.7.0
 torchvision
 Pillow
 requests
+executorch==0.6.0
+torchao==0.10.0
