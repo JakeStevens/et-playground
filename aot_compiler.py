@@ -1,5 +1,6 @@
 import torch
 from torch import nn
+import torchvision.models as models # Added for ResNet18
 from executorch.backends.xnnpack.partition.xnnpack_partitioner import XnnpackPartitioner
 from executorch.backends.xnnpack.quantizer.xnnpack_quantizer import XNNPACKQuantizer
 from executorch.exir import to_edge, EdgeCompileConfig
@@ -30,13 +31,16 @@ class SimpleModel(nn.Module):
 def compile_model_to_executorch(
     model: nn.Module,
     example_inputs: tuple,
-    output_pte_path: str = "model_xnnpack.pte",
-    enable_quantization: bool = False # New flag
+    output_pte_path: str = None, # Changed default to None
+    enable_quantization: bool = False
 ):
     """
-    Optionally performs PTQ, lowers to XNNPACK, and saves the .pte file.
+    Optionally performs PTQ, lowers to XNNPACK, and saves the .pte file if output_pte_path is provided.
+    Returns the ExecuTorchProgram object.
     """
-    print(f"Starting compilation for {output_pte_path} (Quantization: {enable_quantization})...")
+    # Determine a logging name for the output, even if not saving
+    log_name = output_pte_path if output_pte_path else "in-memory program"
+    print(f"Starting compilation for {log_name} (Quantization: {enable_quantization})...")
 
     model.eval()
 
@@ -102,37 +106,79 @@ def compile_model_to_executorch(
     final_program = partitioned_program.to_executorch()
     print("  Converted to ExecuTorch program.")
 
-    print(f"Step 4: Saving .pte program to {output_pte_path}...")
-    try:
-        with open(output_pte_path, "wb") as f:
-            f.write(final_program.buffer)
-        print(f"Successfully saved {output_pte_path}")
-    except Exception as e:
-        print(f"Error saving .pte file: {e}")
-        raise
+    if output_pte_path:
+        print(f"Step 4: Saving .pte program to {output_pte_path}...")
+        try:
+            with open(output_pte_path, "wb") as f:
+                f.write(final_program.buffer)
+            print(f"Successfully saved {output_pte_path}")
+        except Exception as e:
+            print(f"Error saving .pte file: {e}")
+            # Still return the program even if saving failed, or re-raise?
+            # For library use, returning is good. For script use, error is clear.
+            # Let's re-raise for now if path was given, as user expected a file.
+            raise
+    else:
+        print("Step 4: Skipping file saving as no output_pte_path was provided.")
 
     return final_program
 
+# compile_resnet18_to_executorch function removed as app.py will call the main compiler directly.
+
 if __name__ == "__main__":
-    import types # Required for MethodType for patching .recompile
+    # import types # Required for MethodType for patching .recompile - This seems not used currently.
+    # If it was for prepare_pt2e or other advanced features, it might be needed if those are re-enabled.
+    # For now, commenting out if not directly used by the current flow.
 
-    print("Running AOT Compiler Script...")
-    simple_model = SimpleModel()
-    dummy_inputs = (torch.randn(1, 3, 32, 32),)
-    print(f"Created dummy inputs with shape: {dummy_inputs[0].shape}")
+    print("Running AOT Compiler Script as __main__ for testing...")
 
-    # Example: Compile without quantization (default)
-    output_filename_no_quant = "aot_model_xnnpack_no_quant_main.pte" # Different name for main run
-    print(f"\nAttempting compilation WITHOUT quantization to {output_filename_no_quant}")
+    # --- Compile SimpleModel (kept for testing file output) ---
+    print("\n--- Compiling SimpleModel (testing file output) ---")
+    simple_model_instance = SimpleModel()
+    dummy_inputs_simple = (torch.randn(1, 3, 32, 32),)
+    print(f"Created dummy inputs for SimpleModel with shape: {dummy_inputs_simple[0].shape}")
+
+    output_filename_simple_model = "aot_simple_model_xnnpack_main_test.pte"
+    print(f"\nAttempting SimpleModel compilation WITHOUT quantization, saving to {output_filename_simple_model}")
+
     try:
-        compile_model_to_executorch(
-            simple_model,
-            dummy_inputs,
-            output_filename_no_quant,
+        # Call the modified function, providing a path to test saving
+        compiled_program = compile_model_to_executorch(
+            model=simple_model_instance,
+            example_inputs=dummy_inputs_simple,
+            output_pte_path=output_filename_simple_model,
             enable_quantization=False
         )
-        print(f"Compilation without quantization successful.")
-    except Exception as e:
-        print(f"An error occurred during non-quantized compilation: {e}")
+        if compiled_program:
+            print(f"SimpleModel compilation successful. Program returned. Saved to {output_filename_simple_model}")
+            # Basic check on the returned program
+            print(f"Returned program type: {type(compiled_program)}")
+        else:
+            # This case should ideally not happen if no exception during compilation
+            print("SimpleModel compilation did not return a program object, check for errors.")
 
-    print("\nAOT Compiler Script finished.")
+    except Exception as e:
+        print(f"An error occurred during SimpleModel compilation for __main__ test: {e}")
+        import traceback
+        traceback.print_exc()
+
+    # Example of calling without saving (could be useful for other tests)
+    print("\n--- Compiling SimpleModel (testing in-memory compilation) ---")
+    try:
+        in_memory_program = compile_model_to_executorch(
+            model=simple_model_instance, # Reuse same model and inputs
+            example_inputs=dummy_inputs_simple,
+            output_pte_path=None, # Explicitly None
+            enable_quantization=False
+        )
+        if in_memory_program:
+            print("SimpleModel in-memory compilation successful. Program returned.")
+            print(f"Returned program type: {type(in_memory_program)}")
+        else:
+            print("SimpleModel in-memory compilation did not return a program object.")
+    except Exception as e:
+        print(f"An error occurred during SimpleModel in-memory compilation test: {e}")
+        import traceback
+        traceback.print_exc()
+
+    print("\nAOT Compiler Script (__main__) finished.")
